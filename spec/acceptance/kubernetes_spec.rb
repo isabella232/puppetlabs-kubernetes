@@ -5,10 +5,11 @@ describe 'the Kubernetes module' do
     before(:each) do
     end
 
-    describe 'kubernetes class' do
+    describe 'kubernetes class', :integration do
 
       context 'it should install the module and run' do
-
+        before(:all) { change_target_host('master') }
+        after(:all) { reset_target_host }
         pp = <<-MANIFEST
         if $facts['os']['family'] == 'redhat'{
           class {'kubernetes':
@@ -48,7 +49,8 @@ describe 'the Kubernetes module' do
       end
 
       context 'application deployment' do
-
+        before(:all) { change_target_host('master') }
+        after(:all) { reset_target_host }
         it 'can deploy an application into a namespace and expose it' do
           run_shell('sleep 180')
           run_shell('KUBECONFIG=/etc/kubernetes/admin.conf kubectl create -f /tmp/nginx.yml') do |r|
