@@ -1,9 +1,3 @@
-# @summary Provisions machines
-#
-# Provisions machines for integration testing
-#
-# @example
-#   kubernetes::provision_integration
 plan kubernetes::provision_gcp_abs(
   Optional[String] $gcp_image = 'centos-7-x86_64',
 ) {

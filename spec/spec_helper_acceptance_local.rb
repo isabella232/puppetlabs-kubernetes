@@ -44,7 +44,7 @@ def fetch_ip_hostname_by_role(role)
    #Fetch hostname and  ip adress for each node
    ipaddr = target_roles(role)[0][:name]
    platform = fetch_platform_by_node(ipaddr)
-   ENV['TARGET_HOST'] = target_roles('master')[0][:name]
+   ENV['TARGET_HOST'] = target_roles(role)[0][:name]
    hostname = run_shell('hostname').stdout.strip
    if os[:family] == 'redhat'
      int_ipaddr = run_shell("ip route get 8.8.8.8 | awk '{print $7; exit}'").stdout.strip
@@ -63,14 +63,78 @@ def reset_target_host
   ENV['TARGET_HOST'] = @orig_target_host
 end
 
+def configure_puppet_server(master, controller, worker)
+  # Configure the puppet server
+  ENV['TARGET_HOST'] = target_roles('master')[0][:name]
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'master', 'setting' => 'dns_alt_names', 'value' => "#{master},puppet")
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'server', 'value' => master)
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'certname', 'value' => master)
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'environment', 'value' => 'production')
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'runinterval', 'value' => '1h')
+  run_shell('systemctl start puppetserver')
+  run_shell('systemctl start puppetserver')
+  # Configure the puppet agents
+  configure_puppet_agent('controller', master, controller)
+  puppet_cert_sign(controller)
+  configure_puppet_agent('worker', master, worker)
+  puppet_cert_sign(worker)
+  # Create site.pp
+  site_pp = <<-EOS
+  node 'kube-master' {
+    class {'kubernetes':
+    controller => true,
+  }
+  node 'kube-node-01' {
+    class {'kubernetes':
+    controller => true,
+  }
+  node 'kube-node-02'  {
+    class {'kubernetes':
+    worker => true,
+  }
+  EOS
+  ENV['TARGET_HOST'] = target_roles('master')[0][:name]
+  environment_base_path = run_shell('puppet config print environmentpath').stdout.rstrip
+  prod_env_site_pp_path = File.join(environment_base_path, 'production', 'manifests')
+  create_remote_file("site.pp", prod_env_site_pp_path, site_pp)
+end
+
+def configure_puppet_agent(role, master, agent)
+  # Configure the puppet agents
+  ENV['TARGET_HOST'] = target_roles(role)[0][:name]
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'server', 'value' => master)
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'certname', 'value' => agent)
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'environment', 'value' => 'production')
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'runinterval', 'value' => '1h')
+  run_shell('/opt/puppetlabs/bin/puppet resource service puppet ensure=running enable=true')
+  run_shell("puppet agent --test", expect_failures: true)
+end
+
+def puppet_cert_sign(agent)
+  # Sign the certs
+  ENV['TARGET_HOST'] = target_roles('master')[0][:name]
+  run_shell("puppetserver ca sign --certname #{agent}", expect_failures: true)
+  run_shell("puppet agent --test", expect_failures: true)
+end
+
 RSpec.configure do |c|
   c.before :suite do
     # Fetch hostname and  ip adress for each node
     hostname1, ipaddr1, int_ipaddr1 =  fetch_ip_hostname_by_role('master')
     hostname2, ipaddr2, int_ipaddr2 =  fetch_ip_hostname_by_role('controller')
-    hostname2, ipaddr3, int_ipaddr3 =  fetch_ip_hostname_by_role('worker')
+    hostname3, ipaddr3, int_ipaddr3 =  fetch_ip_hostname_by_role('worker')
     if c.filter.rules.key? :integration
       ENV['TARGET_HOST'] = target_roles('master')[0][:name]
+      hosts_file = <<-EOS
+      #{ipaddr1} #{hostname1}
+      #{ipaddr2} #{hostname2}
+      #{ipaddr3} #{hostname3}
+      #{int_ipaddr1} #{hostname1}
+      #{int_ipaddr2} #{hostname2}
+      #{int_ipaddr3} #{hostname3}
+            EOS
+      create_remote_file("hosts","/etc/hosts", hosts_file)
+      configure_puppet_server(hostname1, hostname2, hostname3)
     else
       c.filter_run_excluding :integration
     end
@@ -99,9 +163,7 @@ hosts_file = <<-EOS
 #{ipaddr2} kube-node-01
 #{ipaddr3} kube-node-02
 #{int_ipaddr1} #{hostname1}
-#{int_ipaddr1} kubernetes
 #{int_ipaddr1} kube-master
-#{int_ipaddr1} kube-control-plane
 #{int_ipaddr2} kube-node-01
 #{int_ipaddr3} kube-node-02
       EOS
@@ -126,7 +188,7 @@ spec:
       - name: my-nginx
         image: nginx
         ports:
-        - containerPort: 80
+        - containerPort: 9880
 ---
 apiVersion: v1
 kind: Service
@@ -181,7 +243,7 @@ EOS
     }
   PUPPETCODE
   apply_manifest(pp)
-  if family =~ /debian/ || family =~ /ubuntu-1604-lts/
+  if family =~ /debian|ubuntu-1604-lts/
     runtime = 'cri_containerd'
     cni = 'weave'
     run_shell('apt-get update && apt-get install -y apt-transport-https')
@@ -199,7 +261,7 @@ EOS
       run_shell('/sbin/iptables -F')
     end
   end
-  if family =~ /redhat/ || family =~ /centos/
+  if family =~ /redhat|centos/
     runtime = 'docker'
     cni = 'flannel'
     run_shell('gpg --keyserver hkp://keys.gnupg.net --recv-keys 409B6B1796C275462A1703113804BB82D39DC0E3 7D2BAF1CF37B13E2069D6956105BD0E739499BDB')
@@ -225,11 +287,11 @@ EOS
   run_shell('mkdir -p /etc/puppetlabs/code/environments/production/hieradata')
   run_shell("cp $HOME/hieradata/*.yaml /etc/puppetlabs/code/environments/production/hieradata/")
 
-  if family =~ /debian/ || family =~ /ubuntu-1604-lts/
+  if family =~ /debian|ubuntu-1604-lts/
     run_shell("echo 'kubernetes::cni_network_provider: https://cloud.weave.works/k8s/net?k8s-version=1.16.6' >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   end
 
-  if family =~ /redhat/ || family =~ /centos/
+  if family =~ /redhat|centos/
     run_shell("echo 'kubernetes::cni_network_provider: https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml' >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   end
 
@@ -240,4 +302,3 @@ EOS
 
 end
 end
-
