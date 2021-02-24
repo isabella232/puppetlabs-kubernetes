@@ -5,3 +5,4 @@ plan kubernetes::puppetserver_setup(
   # install pe server
   run_task('provision::install_puppetserver', $puppet_server)
 }
+

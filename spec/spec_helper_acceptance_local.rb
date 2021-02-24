@@ -72,7 +72,7 @@ def configure_puppet_server(master, controller, worker)
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'environment', 'value' => 'production')
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'runinterval', 'value' => '1h')
   run_shell('systemctl start puppetserver')
-  run_shell('systemctl start puppetserver')
+  run_shell('systemctl enable puppetserver')
   # Configure the puppet agents
   configure_puppet_agent('controller', master, controller)
   puppet_cert_sign(controller)
@@ -80,23 +80,27 @@ def configure_puppet_server(master, controller, worker)
   puppet_cert_sign(worker)
   # Create site.pp
   site_pp = <<-EOS
-  node 'kube-master' {
+  node '#{master}' {
     class {'kubernetes':
     controller => true,
+    }
   }
-  node 'kube-node-01' {
-    class {'kubernetes':
-    controller => true,
-  }
-  node 'kube-node-02'  {
+  node '#{controller}' {
     class {'kubernetes':
     worker => true,
+    }
+  }
+  node '#{worker}'  {
+    class {'kubernetes':
+    worker => true,
+    }
   }
   EOS
   ENV['TARGET_HOST'] = target_roles('master')[0][:name]
   environment_base_path = run_shell('puppet config print environmentpath').stdout.rstrip
   prod_env_site_pp_path = File.join(environment_base_path, 'production', 'manifests')
-  create_remote_file("site.pp", prod_env_site_pp_path, site_pp)
+  create_remote_file("site","/etc/puppetlabs/code/environments/production/manifests/site.pp", site_pp)
+  run_shell('chmod 644 /etc/puppetlabs/code/environments/production/manifests/site.pp')
 end
 
 def configure_puppet_agent(role, master, agent)
@@ -117,6 +121,11 @@ def puppet_cert_sign(agent)
   run_shell("puppet agent --test", expect_failures: true)
 end
 
+def clear_certs(role)
+  ENV['TARGET_HOST'] = target_roles(role)[0][:name]
+  run_shell('rm -rf /etc/kubernetes/kubelet.conf /etc/kubernetes/pki/ca.crt /etc/kubernetes/bootstrap-kubelet.conf')
+end
+
 RSpec.configure do |c|
   c.before :suite do
     # Fetch hostname and  ip adress for each node
@@ -126,6 +135,7 @@ RSpec.configure do |c|
     if c.filter.rules.key? :integration
       ENV['TARGET_HOST'] = target_roles('master')[0][:name]
       hosts_file = <<-EOS
+      127.0.0.1 localhost
       #{ipaddr1} #{hostname1}
       #{ipaddr2} #{hostname2}
       #{ipaddr3} #{hostname3}
@@ -133,7 +143,10 @@ RSpec.configure do |c|
       #{int_ipaddr2} #{hostname2}
       #{int_ipaddr3} #{hostname3}
             EOS
-      create_remote_file("hosts","/etc/hosts", hosts_file)
+      ['master', 'controller', 'worker'].each { |node|
+        ENV['TARGET_HOST'] = target_roles(node)[0][:name]
+        create_remote_file("hosts","/etc/hosts", hosts_file)
+      }
       configure_puppet_server(hostname1, hostname2, hostname3)
     else
       c.filter_run_excluding :integration
@@ -145,7 +158,6 @@ RSpec.configure do |c|
 
     run_shell('puppet module install puppetlabs-stdlib')
     run_shell('puppet module install puppetlabs-apt')
-    run_shell('puppet module install stahnma-epel')
     run_shell('puppet module install maestrodev-wget')
     run_shell('puppet module install puppetlabs-translate')
     run_shell('puppet module install puppet-archive')
@@ -157,15 +169,13 @@ RSpec.configure do |c|
     run_shell('puppet module install puppetlabs-rook --ignore-dependencies')
 
 hosts_file = <<-EOS
-127.0.0.1 localhost #{hostname1} kubernetes kube-master
+127.0.0.1 localhost
 #{ipaddr1} #{hostname1}
-#{ipaddr1} kube-master
-#{ipaddr2} kube-node-01
-#{ipaddr3} kube-node-02
+#{ipaddr2} #{hostname2}
+#{ipaddr3} #{hostname3}
 #{int_ipaddr1} #{hostname1}
-#{int_ipaddr1} kube-master
-#{int_ipaddr2} kube-node-01
-#{int_ipaddr3} kube-node-02
+#{int_ipaddr2} #{hostname2}
+#{int_ipaddr3} #{hostname3}
       EOS
 
       nginx = <<-EOS
@@ -260,30 +270,35 @@ EOS
       run_shell('echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" >> /etc/apt/sources.list.d/kube-xenial.list')
       run_shell('/sbin/iptables -F')
     end
-  end
+  end 
   if family =~ /redhat|centos/
     runtime = 'docker'
     cni = 'flannel'
-    run_shell('gpg --keyserver hkp://keys.gnupg.net --recv-keys 409B6B1796C275462A1703113804BB82D39DC0E3 7D2BAF1CF37B13E2069D6956105BD0E739499BDB')
-    run_shell('setenforce 0 || true')
-    run_shell('swapoff -a')
-    run_shell('systemctl stop firewalld && systemctl disable firewalld')
-    run_shell('yum install -y yum-utils device-mapper-persistent-data lvm2')
-    run_shell('yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo')
-    run_shell('yum update -y')
-    run_shell('yum install -y docker-ce-18.06.3.ce-3.el7')
-    run_shell("usermod -aG docker $(whoami)")
-    run_shell('systemctl start docker.service')
-    create_remote_file("k8repo","/etc/yum.repos.d/kubernetes.repo", k8repo)
-    run_shell('yum install -y kubectl')
+    ['master', 'controller', 'worker'].each { |node|
+      ENV['TARGET_HOST'] = target_roles(node)[0][:name]
+      run_shell('setenforce 0 || true')
+      run_shell('swapoff -a')
+      run_shell('systemctl stop firewalld && systemctl disable firewalld')
+      run_shell('yum install -y yum-utils device-mapper-persistent-data lvm2')
+      run_shell('yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo')
+      run_shell('yum update -y')
+      run_shell('yum install -y docker-ce-18.06.3.ce-3.el7')
+      run_shell("usermod -aG docker $(whoami)")
+      run_shell('systemctl start docker.service')
+      create_remote_file("k8repo","/etc/yum.repos.d/kubernetes.repo", k8repo)
+      run_shell('yum install -y kubectl')
+    }
   end
 
+  ENV['TARGET_HOST'] = target_roles('master')[0][:name]
   run_shell('docker build -t kubetool:latest /etc/puppetlabs/code/environments/production/modules/kubernetes/tooling')
   run_shell("docker run --rm -v $(pwd)/hieradata:/mnt -e OS=#{family} -e VERSION=1.16.6 -e CONTAINER_RUNTIME=#{runtime} -e CNI_PROVIDER=#{cni} -e ETCD_INITIAL_CLUSTER=#{hostname1}:#{int_ipaddr1} -e ETCD_IP=#{int_ipaddr1} -e ETCD_PEERS=[#{int_ipaddr1},#{int_ipaddr2},#{int_ipaddr3}] -e KUBE_API_ADVERTISE_ADDRESS=#{int_ipaddr1} -e INSTALL_DASHBOARD=true kubetool:latest")
   create_remote_file("hosts","/etc/hosts", hosts_file)
   create_remote_file("nginx","/tmp/nginx.yml", nginx)
   create_remote_file("hiera","/etc/puppetlabs/puppet/hiera.yaml", hiera)
+  run_shell('chmod 644 /etc/puppetlabs/puppet/hiera.yaml')
   create_remote_file("hiera_prod","/etc/puppetlabs/code/environments/production/hiera.yaml", hiera)
+  run_shell('chmod 644 /etc/puppetlabs/code/environments/production/hiera.yaml')
   run_shell('mkdir -p /etc/puppetlabs/code/environments/production/hieradata')
   run_shell("cp $HOME/hieradata/*.yaml /etc/puppetlabs/code/environments/production/hieradata/")
 
@@ -298,6 +313,7 @@ EOS
   run_shell("sed -i /cni_network_provider/d /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   run_shell("echo 'kubernetes::schedule_on_controller: true'  >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   run_shell("echo 'kubernetes::taint_master: false' >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
+  run_shell("echo 'kubernetes::manage_docker: false' >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   run_shell("export KUBECONFIG=\'/etc/kubernetes/admin.conf\'")
 
 end
