@@ -6,3 +6,4 @@ plan kubernetes::puppetserver_setup(
   run_task('provision::install_puppetserver', $puppet_server)
 }
 
+

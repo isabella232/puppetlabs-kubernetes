@@ -34,7 +34,7 @@ describe 'the Kubernetes module' do
                 }
           }
     MANIFEST
-        
+
         it 'should run' do
           apply_manifest(pp)
         end
@@ -52,15 +52,14 @@ describe 'the Kubernetes module' do
         before(:all) { change_target_host('master') }
         after(:all) { reset_target_host }
         it 'can deploy an application into a namespace and expose it' do
-          run_shell('sleep 180')
           run_shell('KUBECONFIG=/etc/kubernetes/admin.conf kubectl create -f /tmp/nginx.yml') do |r|
             expect(r.stdout).to match(/my-nginx created\nservice\/my-nginx created\n/)
           end
         end
 
         it 'can access the deployed service' do
-          run_shell('sleep 60')
-          run_shell('curl -s 10.96.188.5') do |r|
+          sleep(180)
+          run_shell('curl -s 10.96.188.5', expect_failures: true) do |r|
             expect(r.stdout).to match (/Welcome to nginx!/)
           end
         end

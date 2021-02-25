@@ -71,8 +71,10 @@ def configure_puppet_server(master, controller, worker)
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'certname', 'value' => master)
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'environment', 'value' => 'production')
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'runinterval', 'value' => '1h')
+  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'autosign', 'value' => 'true')
   run_shell('systemctl start puppetserver')
   run_shell('systemctl enable puppetserver')
+  execute_agent('master')
   # Configure the puppet agents
   configure_puppet_agent('controller', master, controller)
   puppet_cert_sign(controller)
@@ -82,23 +84,36 @@ def configure_puppet_server(master, controller, worker)
   site_pp = <<-EOS
   node '#{master}' {
     class {'kubernetes':
-    controller => true,
+      kubernetes_version => '1.16.6',
+      kubernetes_package_version => '1.16.6',
+      controller_address => "$::ipaddress:6443",
+      container_runtime => 'docker',
+      manage_docker => false,
+      controller => true,
+      schedule_on_controller => true,
+      environment  => ['HOME=/root', 'KUBECONFIG=/etc/kubernetes/admin.conf'],
+      ignore_preflight_errors => ['NumCPU','ExternalEtcdVersion'],
+      cgroup_driver => 'cgroupfs',
     }
   }
   node '#{controller}' {
     class {'kubernetes':
-    worker => true,
+      worker => true,
+      ignore_preflight_errors => ['FileAvailable'],
+      manage_docker => false,
+      cgroup_driver => 'cgroupfs',
     }
   }
   node '#{worker}'  {
     class {'kubernetes':
-    worker => true,
+      worker => true,
+      ignore_preflight_errors => ['FileAvailable'],
+      manage_docker => false,
+      cgroup_driver => 'cgroupfs',
     }
   }
   EOS
   ENV['TARGET_HOST'] = target_roles('master')[0][:name]
-  environment_base_path = run_shell('puppet config print environmentpath').stdout.rstrip
-  prod_env_site_pp_path = File.join(environment_base_path, 'production', 'manifests')
   create_remote_file("site","/etc/puppetlabs/code/environments/production/manifests/site.pp", site_pp)
   run_shell('chmod 644 /etc/puppetlabs/code/environments/production/manifests/site.pp')
 end
@@ -111,19 +126,23 @@ def configure_puppet_agent(role, master, agent)
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'environment', 'value' => 'production')
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'runinterval', 'value' => '1h')
   run_shell('/opt/puppetlabs/bin/puppet resource service puppet ensure=running enable=true')
-  run_shell("puppet agent --test", expect_failures: true)
+  execute_agent(role)
 end
 
 def puppet_cert_sign(agent)
   # Sign the certs
   ENV['TARGET_HOST'] = target_roles('master')[0][:name]
   run_shell("puppetserver ca sign --certname #{agent}", expect_failures: true)
-  run_shell("puppet agent --test", expect_failures: true)
 end
 
 def clear_certs(role)
   ENV['TARGET_HOST'] = target_roles(role)[0][:name]
   run_shell('rm -rf /etc/kubernetes/kubelet.conf /etc/kubernetes/pki/ca.crt /etc/kubernetes/bootstrap-kubelet.conf')
+end
+
+def execute_agent(role)
+  ENV['TARGET_HOST'] = target_roles(role)[0][:name]
+  run_shell('puppet agent --test', expect_failures: true)
 end
 
 RSpec.configure do |c|
@@ -135,13 +154,15 @@ RSpec.configure do |c|
     if c.filter.rules.key? :integration
       ENV['TARGET_HOST'] = target_roles('master')[0][:name]
       hosts_file = <<-EOS
-      127.0.0.1 localhost
-      #{ipaddr1} #{hostname1}
-      #{ipaddr2} #{hostname2}
-      #{ipaddr3} #{hostname3}
-      #{int_ipaddr1} #{hostname1}
-      #{int_ipaddr2} #{hostname2}
-      #{int_ipaddr3} #{hostname3}
+127.0.0.1 localhost
+#{ipaddr1} puppet
+#{ipaddr1} #{hostname1}
+#{ipaddr2} #{hostname2}
+#{ipaddr3} #{hostname3}
+#{int_ipaddr1} puppet
+#{int_ipaddr1} #{hostname1}
+#{int_ipaddr2} #{hostname2}
+#{int_ipaddr3} #{hostname3}
             EOS
       ['master', 'controller', 'worker'].each { |node|
         ENV['TARGET_HOST'] = target_roles(node)[0][:name]
@@ -151,7 +172,7 @@ RSpec.configure do |c|
     else
       c.filter_run_excluding :integration
     end
-
+    ENV['TARGET_HOST'] = target_roles('master')[0][:name]
     family = fetch_platform_by_node(ENV['TARGET_HOST'])
 
     puts "Running acceptance test on #{hostname1} with address #{ipaddr1} and OS #{family}"
@@ -169,10 +190,11 @@ RSpec.configure do |c|
     run_shell('puppet module install puppetlabs-rook --ignore-dependencies')
 
 hosts_file = <<-EOS
-127.0.0.1 localhost
+#{ipaddr1} puppet
 #{ipaddr1} #{hostname1}
 #{ipaddr2} #{hostname2}
 #{ipaddr3} #{hostname3}
+#{int_ipaddr1} puppet
 #{int_ipaddr1} #{hostname1}
 #{int_ipaddr2} #{hostname2}
 #{int_ipaddr3} #{hostname3}
@@ -198,7 +220,7 @@ spec:
       - name: my-nginx
         image: nginx
         ports:
-        - containerPort: 9880
+        - containerPort: 80
 ---
 apiVersion: v1
 kind: Service
@@ -261,8 +283,10 @@ EOS
     run_shell('echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee -a /etc/apt/sources.list.d/kubernetes.list')
     run_shell('apt-get update')
     run_shell('apt-get install -y kubectl')
+    run_shell('sudo apt install docker-ce=18.06.0~ce~3-0~ubuntu  docker-ce-cli=18.06.0~ce~3-0~ubuntu -y')
     run_shell('sudo apt install docker.io -y')
-
+    run_shell('systemctl start docker.service')
+    run_shell('systemctl enable docker.service')
     if family =~ /ubuntu-1604-lts/
       run_shell('sudo ufw disable')
     else
@@ -270,7 +294,7 @@ EOS
       run_shell('echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" >> /etc/apt/sources.list.d/kube-xenial.list')
       run_shell('/sbin/iptables -F')
     end
-  end 
+  end
   if family =~ /redhat|centos/
     runtime = 'docker'
     cni = 'flannel'
@@ -282,9 +306,11 @@ EOS
       run_shell('yum install -y yum-utils device-mapper-persistent-data lvm2')
       run_shell('yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo')
       run_shell('yum update -y')
-      run_shell('yum install -y docker-ce-18.06.3.ce-3.el7')
+      run_shell('yum install -y docker-ce-cli-18.09.0-3.el7.x86_64')
+      run_shell('yum install -y docker-ce-18.09.5-3.el7.x86_64')
       run_shell("usermod -aG docker $(whoami)")
       run_shell('systemctl start docker.service')
+      run_shell('systemctl enable docker.service')
       create_remote_file("k8repo","/etc/yum.repos.d/kubernetes.repo", k8repo)
       run_shell('yum install -y kubectl')
     }
@@ -302,6 +328,8 @@ EOS
   run_shell('mkdir -p /etc/puppetlabs/code/environments/production/hieradata')
   run_shell("cp $HOME/hieradata/*.yaml /etc/puppetlabs/code/environments/production/hieradata/")
 
+  run_shell("sed -i /cni_network_provider/d /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
+
   if family =~ /debian|ubuntu-1604-lts/
     run_shell("echo 'kubernetes::cni_network_provider: https://cloud.weave.works/k8s/net?k8s-version=1.16.6' >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   end
@@ -310,11 +338,13 @@ EOS
     run_shell("echo 'kubernetes::cni_network_provider: https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml' >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   end
 
-  run_shell("sed -i /cni_network_provider/d /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   run_shell("echo 'kubernetes::schedule_on_controller: true'  >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   run_shell("echo 'kubernetes::taint_master: false' >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   run_shell("echo 'kubernetes::manage_docker: false' >> /etc/puppetlabs/code/environments/production/hieradata/#{family.capitalize}.yaml")
   run_shell("export KUBECONFIG=\'/etc/kubernetes/admin.conf\'")
-
+  execute_agent('master')
+  execute_agent('controller')
+  execute_agent('worker')
+  sleep(60)
 end
 end
