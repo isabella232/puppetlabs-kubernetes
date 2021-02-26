@@ -66,13 +66,14 @@ end
 def configure_puppet_server(master, controller, worker)
   # Configure the puppet server
   ENV['TARGET_HOST'] = target_roles('master')[0][:name]
-  run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'master', 'setting' => 'dns_alt_names', 'value' => "#{master},puppet")
+  #run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'master', 'setting' => 'dns_alt_names', 'value' => "#{master},puppet")
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'server', 'value' => master)
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'certname', 'value' => master)
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'environment', 'value' => 'production')
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'runinterval', 'value' => '1h')
   run_bolt_task('puppet_conf', 'action' => 'set', 'section' => 'main', 'setting' => 'autosign', 'value' => 'true')
-  run_shell("echo 'kubernetes::schedule_on_controller: true'  >> /etc/puppetlabs/puppet/puppet.conf")
+  run_shell("echo '[master]'  >> /etc/puppetlabs/puppet/puppet.conf")
+  run_shell("echo 'dns_alt_names=#{master},puppet'  >> /etc/puppetlabs/puppet/puppet.conf")
   run_shell('systemctl start puppetserver')
   run_shell('systemctl enable puppetserver')
   execute_agent('master')
@@ -115,8 +116,8 @@ def configure_puppet_server(master, controller, worker)
   }
   EOS
   ENV['TARGET_HOST'] = target_roles('master')[0][:name]
-  create_remote_file("site","/etc/puppetlabs/code/environments/production/manifests/site.pp", site_pp)
-  run_shell('chmod 644 /etc/puppetlabs/code/environments/production/manifests/site.pp')
+  #create_remote_file("site","/etc/puppetlabs/code/environments/production/manifests/site.pp", site_pp)
+  #run_shell('chmod 644 /etc/puppetlabs/code/environments/production/manifests/site.pp')
 end
 
 def configure_puppet_agent(role, master, agent)
